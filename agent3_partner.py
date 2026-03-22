@@ -1,29 +1,14 @@
-"""
-Phase 3 -- Agent 3: The Partner
-================================
-Responsibilities:
-  1. Accept a fully enriched EnrichedItem from Agent 2.
-  2. Serialize its quantitative and qualitative payload into a grounded
-     context block that leaves the LLM no room to hallucinate metrics.
-  3. Call the Groq API with a strict VC-Partner system prompt.
-  4. Return a structured, citation-enforced Markdown investment memo.
-
-Hallucination guardrails (mirroring claude.md section 4):
-  - Every claim in the memo must reference its source metric inline.
-  - If `data_gaps` is non-empty, a "Data Limitations" section is MANDATORY
-    and must reproduce each gap string verbatim -- no paraphrasing.
-  - If metrics are entirely absent, the function raises rather than drafting
-    a memo based purely on qualitative signal. Guessing is not permitted.
-"""
-
 from __future__ import annotations
 
+import json
 import os
+import re
 import textwrap
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from groq import Groq
+from pydantic import BaseModel, Field
 
 # -- Local imports from Phase 1 & 2 --
 from agent1_scout import (
@@ -43,9 +28,6 @@ from agent2_github_quant import (
 )
 
 
-# ─────────────────────────────────────────────
-# §1  System Prompt
-# ─────────────────────────────────────────────
 
 PARTNER_SYSTEM_PROMPT = """
 You are The Partner -- the final decision-making agent in a ruthless technical venture-capital analysis pipeline. Your output is a formal investment memo that will be read by a Managing Partner before a capital allocation decision.
@@ -120,9 +102,74 @@ ABSOLUTE RULES -- VIOLATIONS WILL INVALIDATE THE MEMO
 """.strip()
 
 
-# ─────────────────────────────────────────────
-# §2  Context Serialiser
-# ─────────────────────────────────────────────
+
+class PartnerOutput(BaseModel):
+    """
+    Structured output contract for Agent 3.
+
+    Separates the LLM's internal deliberation (chain_of_thought) from
+    its final deliverable (memo_md).  Using a Pydantic model with JSON
+    mode enforces this separation structurally — the LLM cannot produce
+    a memo without also producing the reasoning trace.
+
+    chain_of_thought: The Partner's internal deliberation before writing.
+      It should debate: (a) whether the Agent 2 metrics support the Agent 1
+      signal, (b) how each data gap limits conviction, (c) whether the
+      trajectory justifies HIGH CONVICTION vs MONITOR vs PASS.
+
+    memo_md: The final Markdown investment memo, following the six-section
+      format defined in PARTNER_SYSTEM_PROMPT exactly.
+    """
+    chain_of_thought: str = Field(
+        ...,
+        description=(
+            "Internal deliberation (3-5 sentences) that explicitly debates: "
+            "(1) whether Agent 2's quantitative data supports or contradicts "
+            "Agent 1's signal, (2) how each data gap affects conviction, "
+            "(3) the final verdict reasoning. This is audited for logical "
+            "consistency with the memo verdict."
+        ),
+    )
+    memo_md: str = Field(
+        ...,
+        description=(
+            "The complete investment memo in Markdown, following the six-section "
+            "format from the system prompt exactly. All metric citations must "
+            "reference values from the QUANTITATIVE CONTEXT block."
+        ),
+    )
+
+
+PARTNER_JSON_SYSTEM_PROMPT = PARTNER_SYSTEM_PROMPT + """
+
+═══════════════════════════════════════════════════
+JSON OUTPUT WRAPPER — REQUIRED
+═══════════════════════════════════════════════════
+You MUST wrap your entire response in the following JSON structure.
+Do NOT output raw Markdown — output a JSON object with exactly these two keys:
+
+{
+  "chain_of_thought": "<your 3-5 sentence internal deliberation here>",
+  "memo_md": "<the complete Markdown memo here, with all six sections>"
+}
+
+chain_of_thought instructions:
+  - Debate whether Agent 2's quantitative metrics (commits, TTR, stars) support
+    Agent 1's signal verdict.
+  - Explicitly state how each data gap limits your conviction.
+  - Reason through whether the evidence justifies HIGH CONVICTION / MONITOR / PASS
+    before you commit to the verdict in the memo.
+  - 3-5 sentences. No hedging — be direct.
+
+memo_md instructions:
+  - Contains the full Markdown memo with all six sections.
+  - Escape any double-quotes inside the memo as \".
+  - Do not nest JSON inside the memo_md value.
+
+Return ONLY the JSON object. No preamble, no explanation, no markdown fences.
+"""
+
+
 
 def _fmt_optional(value: Optional[float | int], suffix: str = "", missing: str = "N/A") -> str:
     """Format a nullable numeric value for the context block."""
@@ -132,20 +179,13 @@ def _fmt_optional(value: Optional[float | int], suffix: str = "", missing: str =
 
 
 def build_context_block(item: EnrichedItem) -> str:
-    """
-    Serialise an EnrichedItem into a structured plaintext context block.
-
-    This is the *only* information Agent 3 is permitted to use. By making it
-    exhaustive and explicit, we eliminate any need for the LLM to rely on
-    parametric memory -- the single largest source of metric hallucination.
-    """
+    
     ci = item.classified
     raw = ci.raw
     rat = ci.rationale
 
     lines: list[str] = []
 
-    # -- Header --
     lines += [
         "=============================================================",
         "   QUANTITATIVE CONTEXT -- DO NOT MODIFY",
@@ -154,7 +194,10 @@ def build_context_block(item: EnrichedItem) -> str:
         "",
     ]
 
-    # -- Signal provenance --
+    body_excerpt = ""
+    if raw.body:
+        body_excerpt = raw.body[:600] + ("..." if len(raw.body) > 600 else "")
+
     lines += [
         "-- SIGNAL PROVENANCE --",
         f"Item ID          : {raw.item_id}",
@@ -163,6 +206,7 @@ def build_context_block(item: EnrichedItem) -> str:
         f"URL              : {raw.url or 'Not provided'}",
         f"Ingested at      : {raw.ingested_at.strftime('%Y-%m-%d %H:%M UTC')}",
         f"Scout confidence : {ci.confidence:.0%}",
+        f"Original post body: {body_excerpt or 'Not available'}",
         "",
     ]
 
@@ -177,15 +221,21 @@ def build_context_block(item: EnrichedItem) -> str:
         "",
     ]
 
-    # -- Per-repo metrics --
     for i, m in enumerate(item.metrics, start=1):
         p  = m.profile
         cv = m.commit_velocity
         ir = m.issue_resolution
 
+        desc_line    = p.description or "Not provided"
+        topics_line  = ", ".join(p.topics) if getattr(p, "topics", None) else "None"
+        homepage_line= getattr(p, "homepage", None) or "Not set"
+
         lines += [
             f"-- REPOSITORY {i} OF {len(item.metrics)}: {p.name_with_owner} --",
             f"  GitHub URL       : {m.github_url}",
+            f"  Description      : {desc_line}",
+            f"  Topics / Tags    : {topics_line}",
+            f"  Homepage         : {homepage_line}",
             f"  Default branch   : {p.default_branch or 'N/A'}",
             f"  Primary language : {p.primary_language or 'N/A'}",
             f"  Stars            : {_fmt_optional(p.stars)}",
@@ -212,7 +262,7 @@ def build_context_block(item: EnrichedItem) -> str:
             "",
         ]
 
-        # -- Data gaps --
+
         if m.data_gaps:
             lines.append("  DATA GAPS (reproduce verbatim in section 5 of the memo):")
             for idx, gap in enumerate(m.data_gaps, start=1):
@@ -222,7 +272,6 @@ def build_context_block(item: EnrichedItem) -> str:
             lines.append("  DATA GAPS: NONE")
             lines.append("")
 
-    # -- Footer --
     lines += [
         "-- END OF QUANTITATIVE CONTEXT --",
         "",
@@ -235,9 +284,6 @@ def build_context_block(item: EnrichedItem) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────
-# §3  User Message Builder
-# ─────────────────────────────────────────────
 
 def build_user_message(item: EnrichedItem) -> str:
     """
@@ -265,18 +311,25 @@ def build_user_message(item: EnrichedItem) -> str:
     return f"{instruction}\n\n{context}"
 
 
-# ─────────────────────────────────────────────
-# §4  Core Memo Drafting Function
-# ─────────────────────────────────────────────
 
 def draft_memo(
-    item:   EnrichedItem,
-    client: Groq,
+    item:        EnrichedItem,
+    client:      Groq,
     *,
-    verbose: bool = True,
-) -> str:
+    verbose:     bool = True,
+    a2_data_log: str  = "",
+) -> PartnerOutput:
     """
-    Accept an EnrichedItem and return a grounded Markdown investment memo.
+    Accept an EnrichedItem and return a PartnerOutput with both the
+    LLM's chain-of-thought deliberation and the final Markdown memo.
+
+    Args:
+        item:        Fully enriched item from Agents 1 & 2.
+        client:      Groq client (injected by api_gateway).
+        verbose:     Whether to print progress to stdout.
+        a2_data_log: Optional formatted summary of Agent 2's raw data
+                     fetched (commits, TTR, gaps) — passed so Agent 3 can
+                     explicitly reason about what the Quant found.
 
     Raises:
         ValueError: If `item.metrics` is empty (no quantitative grounding
@@ -303,30 +356,50 @@ def draft_memo(
 
     user_message = build_user_message(item)
 
+    # Append the Agent 2 data log if provided, so Agent 3 can reason about it
+    if a2_data_log:
+        user_message += (
+            "\n\n── AGENT 2 DATA LOG (for your chain_of_thought only) ──\n"
+            + a2_data_log
+            + "\n─────────────────────────────────────────────────────────\n"
+        )
+
     if verbose:
         print(f"     Context block     : {len(user_message):,} chars  ->  calling API...")
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        max_tokens=2048,
+        max_tokens=3072,                    # extra headroom for CoT + memo
+        response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": PARTNER_SYSTEM_PROMPT},
+            {"role": "system", "content": PARTNER_JSON_SYSTEM_PROMPT},
             {"role": "user",   "content": user_message},
         ],
     )
 
-    memo = response.choices[0].message.content.strip()
+    raw = response.choices[0].message.content.strip()
+
+    # Strip accidental markdown fences
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$",       "", raw)
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Agent 3 returned non-JSON output for '{repo_name}': {raw[:200]}"
+        ) from exc
+
+    output = PartnerOutput(**payload)
 
     if verbose:
-        print(f"     Memo drafted      : {len(memo):,} chars  |  "
+        print(f"     Memo drafted      : {len(output.memo_md):,} chars  |  "
+              f"CoT: {len(output.chain_of_thought):,} chars  |  "
               f"{response.usage.completion_tokens} output tokens")
 
-    return memo
+    return output
 
 
-# ─────────────────────────────────────────────
-# §5  Mock EnrichedItem (standalone testing)
-# ─────────────────────────────────────────────
 
 def build_mock_enriched_item(*, include_data_gaps: bool = False) -> EnrichedItem:
     """
@@ -339,7 +412,7 @@ def build_mock_enriched_item(*, include_data_gaps: bool = False) -> EnrichedItem
     """
     now = datetime.now(timezone.utc)
 
-    # -- Agent 1 output --
+   
     raw = RawItem(
         item_id="hn_41903999",
         source=DataSource.HACKERNEWS,
@@ -377,7 +450,7 @@ def build_mock_enriched_item(*, include_data_gaps: bool = False) -> EnrichedItem
         classified_at=now - timedelta(hours=2),
     )
 
-    # -- Agent 2 output --
+    
     profile = RepoProfile(
         name_with_owner="astral-sh/uv",
         default_branch="main",
@@ -440,9 +513,6 @@ def build_mock_enriched_item(*, include_data_gaps: bool = False) -> EnrichedItem
     return EnrichedItem(classified=classified, metrics=[metrics])
 
 
-# ─────────────────────────────────────────────
-# §6  Entrypoint
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
@@ -451,8 +521,7 @@ if __name__ == "__main__":
     print("  Agent 3: The Partner -- Phase 3 Test Run")
     print("=" * 68)
 
-    # CLI flag: `python agent3_partner.py --with-gaps` to test the
-    # Data Limitations + MONITOR verdict code path.
+    
     with_gaps = "--with-gaps" in sys.argv
 
     mode_label = "WITH data gaps (issues disabled)" if with_gaps else "CLEAN (full data)"
@@ -460,7 +529,7 @@ if __name__ == "__main__":
     print("  Building mock EnrichedItem...")
     mock_item = build_mock_enriched_item(include_data_gaps=with_gaps)
 
-    # Validate early-exit guard.
+    
     print("\n  Validating early-exit guard (empty metrics)...")
     empty_item = EnrichedItem(classified=mock_item.classified, metrics=[])
     try:
@@ -469,9 +538,9 @@ if __name__ == "__main__":
     except ValueError as exc:
         print(f"  PASS: Guard triggered correctly: {exc}")
 
-    # Draft the real memo.
+    
     print(f"\n  Initialising Groq client...")
-    client = Groq()  # reads GROQ_API_KEY from env
+    client = Groq()  
 
     print()
     memo = draft_memo(mock_item, client, verbose=True)
