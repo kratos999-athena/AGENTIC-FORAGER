@@ -1,20 +1,3 @@
-"""
-Phase 2 — Agent 2: The Quantitative Engineer
-==============================================
-Responsibilities:
-  1. Accept a ClassifiedItem where is_signal=True and has_github_targets=True.
-  2. For each GitHub URL, execute a GraphQL query to fetch:
-       - Commit history on the default branch for the last 30 / 60 / 90 days.
-       - The last 50 closed issues (createdAt + closedAt) to compute median TTR.
-  3. Emit a typed, validated EnrichedItem = ClassifiedItem + QuantitativeMetrics.
-
-Design rules (mirroring the hallucination guardrails in claude.md):
-  - Every metric field documents its own data provenance.
-  - If a GraphQL fetch fails or a feature is disabled, the field is None and
-    a human-readable `data_gaps` list explains why — Agent 3 must surface this.
-  - Rate-limit back-off is built in; callers never need retry logic.
-"""
-
 from __future__ import annotations
 
 import os
@@ -26,22 +9,12 @@ from unittest.mock import MagicMock
 
 import requests
 from pydantic import BaseModel, Field, computed_field
-
-# Local import — Agent 1 output is this module's input contract.
 from agent1_scout import ClassifiedItem, Classification, DataSource, RawItem, ScoutRationale
 
 
-# ─────────────────────────────────────────────
-# §1  GitHub GraphQL Endpoint & Auth
-# ─────────────────────────────────────────────
 
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
-
-# Pagination: how many commits to request per page.
-# GitHub's GraphQL API caps history() at 100 nodes per page.
 COMMITS_PER_PAGE = 100
-
-# How many closed issues to pull for TTR calculation.
 ISSUES_TO_FETCH = 50
 
 
@@ -49,17 +22,10 @@ def _github_headers(token: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "X-Github-Next-Global-ID": "1",   # opt-in to stable global IDs
+        "X-Github-Next-Global-ID": "1",  
     }
 
 
-# ─────────────────────────────────────────────
-# §2  GraphQL Query Definition
-# ─────────────────────────────────────────────
-
-# A single compound query fetches both commit history and issue data in one
-# round-trip. The `since` argument on `history` does server-side filtering so
-# we never paginate beyond the 90-day window — keeping token costs predictable.
 
 REPO_METRICS_QUERY = """
 query RepoMetrics(
@@ -117,6 +83,13 @@ query RepoMetrics(
     forkCount
     watchers { totalCount }
     primaryLanguage { name }
+    description
+    homepageUrl
+    repositoryTopics(first: 10) {
+      nodes {
+        topic { name }
+      }
+    }
   }
   rateLimit {
     limit
@@ -127,9 +100,6 @@ query RepoMetrics(
 }
 """.strip()
 
-# The query above uses three separate `since` variables (30/60/90 days).
-# GraphQL doesn't support arithmetic, so we compute timestamps in Python
-# and pass all three as separate variables.
 
 REPO_METRICS_QUERY_FULL = """
 query RepoMetrics(
@@ -184,6 +154,13 @@ query RepoMetrics(
     forkCount
     watchers { totalCount }
     primaryLanguage { name }
+    description
+    homepageUrl
+    repositoryTopics(first: 10) {
+      nodes {
+        topic { name }
+      }
+    }
   }
   rateLimit {
     limit
@@ -195,12 +172,7 @@ query RepoMetrics(
 """.strip()
 
 
-# ─────────────────────────────────────────────
-# §3  Pydantic Data Models
-# ─────────────────────────────────────────────
-
 class CommitVelocity(BaseModel):
-    """Rolling commit counts on the default branch."""
     last_30_days: Optional[int] = Field(None, description="Commits merged in the last 30 days.")
     last_60_days: Optional[int] = Field(None, description="Commits merged in the last 60 days.")
     last_90_days: Optional[int] = Field(None, description="Commits merged in the last 90 days.")
@@ -208,7 +180,6 @@ class CommitVelocity(BaseModel):
     @computed_field
     @property
     def weekly_avg_30d(self) -> Optional[float]:
-        """Average commits per week over the 30-day window."""
         if self.last_30_days is None:
             return None
         return round(self.last_30_days / 4.29, 2)   # 30 / 7
@@ -216,13 +187,7 @@ class CommitVelocity(BaseModel):
     @computed_field
     @property
     def acceleration(self) -> Optional[str]:
-        """
-        Qualitative momentum direction derived from rolling windows.
-        ACCELERATING  → 30d pace > 60d pace
-        DECELERATING  → 30d pace < 60d pace
-        STEADY        → within 10% of each other
-        INSUFFICIENT  → missing data
-        """
+    
         if self.last_30_days is None or self.last_60_days is None:
             return "INSUFFICIENT"
         pace_30 = self.last_30_days / 30
@@ -238,7 +203,7 @@ class CommitVelocity(BaseModel):
 
 
 class IssueResolutionMetrics(BaseModel):
-    """Statistics derived from the last N closed issues."""
+
     sample_size:             int            = Field(...,  description="Number of closed issues analysed.")
     median_hours:            Optional[float]= Field(None, description="Median time-to-resolution in hours.")
     p25_hours:               Optional[float]= Field(None, description="25th-percentile resolution time (hours).")
@@ -256,13 +221,6 @@ class IssueResolutionMetrics(BaseModel):
     @computed_field
     @property
     def responsiveness_grade(self) -> str:
-        """
-        Heuristic grade (A–D) based on median resolution time.
-          A: < 24 hours
-          B: 1–7 days
-          C: 7–30 days
-          D: > 30 days  |  UNKNOWN
-        """
         if self.median_hours is None:
             return "UNKNOWN"
         d = self.median_hours / 24
@@ -273,10 +231,12 @@ class IssueResolutionMetrics(BaseModel):
 
 
 class RepoProfile(BaseModel):
-    """Lightweight metadata about the repository itself."""
     name_with_owner:  str            = Field(..., description="'owner/repo' canonical form.")
     default_branch:   Optional[str]  = Field(None)
     primary_language: Optional[str]  = Field(None)
+    description:      Optional[str]  = Field(None, description="GitHub repository description (the one-liner under the repo name).")
+    topics:           list[str]      = Field(default_factory=list, description="GitHub topic tags on the repository.")
+    homepage:         Optional[str]  = Field(None, description="Project homepage URL if set.")
     stars:            Optional[int]  = Field(None)
     forks:            Optional[int]  = Field(None)
     watchers:         Optional[int]  = Field(None)
@@ -285,7 +245,6 @@ class RepoProfile(BaseModel):
 
 
 class RateLimitSnapshot(BaseModel):
-    """GitHub API rate-limit state captured at query time."""
     limit:      int
     remaining:  int
     used:       int
@@ -293,13 +252,6 @@ class RateLimitSnapshot(BaseModel):
 
 
 class QuantitativeMetrics(BaseModel):
-    """
-    The complete quantitative profile of a single GitHub repository.
-    This is the primary output of Agent 2 and the grounding artifact for Agent 3.
-
-    Hallucination guardrail: `data_gaps` is a mandatory field. If it is non-empty,
-    Agent 3 MUST surface each entry in the memo rather than inferring missing data.
-    """
     github_url:        str                             = Field(..., description="The repo URL that was analysed.")
     profile:           RepoProfile                     = Field(..., description="Repository metadata.")
     commit_velocity:   CommitVelocity                  = Field(..., description="Rolling commit counts.")
@@ -318,11 +270,7 @@ class QuantitativeMetrics(BaseModel):
 
 
 class EnrichedItem(BaseModel):
-    """
-    Final output of Agent 2.
-    Combines the qualitative signal from Agent 1 with quantitative metrics.
-    Consumed directly by Agent 3 (The Partner) for memo synthesis.
-    """
+    
     classified:  ClassifiedItem              = Field(..., description="Full Agent 1 output, unchanged.")
     metrics:     list[QuantitativeMetrics]   = Field(
                      default_factory=list,
@@ -331,30 +279,20 @@ class EnrichedItem(BaseModel):
 
     @property
     def has_sufficient_data(self) -> bool:
-        """True only if every repo returned metrics with no critical data gaps."""
+        
         if not self.metrics:
             return False
         return all(len(m.data_gaps) == 0 for m in self.metrics)
 
     @property
     def primary_metrics(self) -> Optional[QuantitativeMetrics]:
-        """Convenience accessor: first repo's metrics (most signals have one repo)."""
+  
         return self.metrics[0] if self.metrics else None
 
 
-# ─────────────────────────────────────────────
-# §4  URL Parsing
-# ─────────────────────────────────────────────
 
 def parse_github_url(url: str) -> tuple[str, str]:
-    """
-    Extract (owner, repo) from a GitHub URL.
-    Handles: https://github.com/owner/repo, https://github.com/owner/repo.git,
-             https://github.com/owner/repo/tree/main, etc.
-
-    Raises:
-        ValueError: if the URL is not a parseable GitHub repo URL.
-    """
+    
     import re
     pattern = r"https?://github\.com/([^/]+)/([^/?#\.]+)"
     match = re.search(pattern, url)
@@ -363,12 +301,9 @@ def parse_github_url(url: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
-# ─────────────────────────────────────────────
-# §5  GraphQL Execution with Rate-Limit Handling
-# ─────────────────────────────────────────────
 
 class RateLimitExceededError(Exception):
-    """Raised when GitHub returns 403/429 or remaining quota hits zero."""
+
     def __init__(self, reset_at: datetime):
         self.reset_at = reset_at
         super().__init__(f"GitHub rate limit exceeded. Resets at {reset_at.isoformat()}")
@@ -411,11 +346,11 @@ def _execute_graphql(
                 continue
             raise
 
-        # ── Auth failure — fail fast ──────────────────────────────────────
+       
         if response.status_code == 401:
             raise PermissionError("GitHub token is invalid or expired (HTTP 401).")
 
-        # ── Rate limit ────────────────────────────────────────────────────
+      
         if response.status_code in (403, 429):
             reset_str = response.headers.get("X-RateLimit-Reset")
             if reset_str:
@@ -436,31 +371,25 @@ def _execute_graphql(
         response.raise_for_status()
         body = response.json()
 
-        # ── GraphQL-level errors ──────────────────────────────────────────
+       
         if "errors" in body:
             first_error = body["errors"][0]
             error_type  = first_error.get("type", "UNKNOWN")
             error_msg   = first_error.get("message", str(first_error))
 
-            # NOT_FOUND means the repo is private or doesn't exist — no retry.
+        
             if error_type == "NOT_FOUND":
                 raise ValueError(f"Repository not found or private: {error_msg}")
             raise ValueError(f"GitHub GraphQL error [{error_type}]: {error_msg}")
 
         return body.get("data", {})
 
-    raise RuntimeError("GraphQL request failed after all retries.")   # unreachable
+    raise RuntimeError("GraphQL request failed after all retries.") 
 
 
-# ─────────────────────────────────────────────
-# §6  Metrics Calculation Helpers
-# ─────────────────────────────────────────────
 
 def _calc_issue_resolution(issue_nodes: list[dict]) -> tuple[list[float], list[str]]:
-    """
-    Convert raw issue nodes into a list of resolution times (hours).
-    Returns (resolution_hours, warnings) where warnings captures bad records.
-    """
+    
     resolution_hours: list[float] = []
     warnings: list[str] = []
 
@@ -490,7 +419,7 @@ def _calc_issue_resolution(issue_nodes: list[dict]) -> tuple[list[float], list[s
 
 
 def _percentile(data: list[float], pct: float) -> float:
-    """Simple percentile using linear interpolation (mirrors numpy.percentile)."""
+ 
     if not data:
         raise ValueError("Empty list")
     sorted_data = sorted(data)
@@ -501,9 +430,6 @@ def _percentile(data: list[float], pct: float) -> float:
     return sorted_data[lo] + frac * (sorted_data[hi] - sorted_data[lo])
 
 
-# ─────────────────────────────────────────────
-# §7  Core Analysis Function
-# ─────────────────────────────────────────────
 
 def analyse_repository(
     github_url: str,
@@ -519,7 +445,6 @@ def analyse_repository(
     """
     data_gaps: list[str] = []
 
-    # ── Parse URL ─────────────────────────────────────────────────────────
     try:
         owner, repo_name = parse_github_url(github_url)
     except ValueError as exc:
@@ -531,7 +456,6 @@ def analyse_repository(
             data_gaps=[f"CRITICAL: Could not parse GitHub URL — {exc}"],
         )
 
-    # ── Build time-window variables ───────────────────────────────────────
     now     = datetime.now(timezone.utc)
     since90 = (now - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
     since60 = (now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -546,7 +470,6 @@ def analyse_repository(
         "issueCount": ISSUES_TO_FETCH,
     }
 
-    # ── Execute GraphQL ───────────────────────────────────────────────────
     try:
         gql_data = _execute_graphql(
             REPO_METRICS_QUERY_FULL, variables, token, session
@@ -573,25 +496,33 @@ def analyse_repository(
 
     repo = gql_data.get("repository", {})
 
-    # ── Early-exit checks ─────────────────────────────────────────────────
+ 
     if repo.get("isEmpty"):
         data_gaps.append("Repository is empty — no commits or issues available.")
     if repo.get("isArchived"):
         data_gaps.append("Repository is archived — metrics reflect a frozen codebase.")
 
-    # ── Repository profile ────────────────────────────────────────────────
+    raw_topics = repo.get("repositoryTopics", {}) or {}
+    topic_names = [
+        node["topic"]["name"]
+        for node in raw_topics.get("nodes", [])
+        if node and node.get("topic")
+    ]
+
     profile = RepoProfile(
-        name_with_owner = repo.get("nameWithOwner", f"{owner}/{repo_name}"),
-        default_branch  = (repo.get("defaultBranchRef") or {}).get("name"),
-        primary_language= (repo.get("primaryLanguage") or {}).get("name"),
-        stars           = repo.get("stargazerCount"),
-        forks           = repo.get("forkCount"),
-        watchers        = (repo.get("watchers") or {}).get("totalCount"),
-        is_archived     = repo.get("isArchived", False),
-        is_empty        = repo.get("isEmpty", False),
+        name_with_owner  = repo.get("nameWithOwner", f"{owner}/{repo_name}"),
+        default_branch   = (repo.get("defaultBranchRef") or {}).get("name"),
+        primary_language = (repo.get("primaryLanguage") or {}).get("name"),
+        description      = repo.get("description") or None,
+        topics           = topic_names,
+        homepage         = repo.get("homepageUrl") or None,
+        stars            = repo.get("stargazerCount"),
+        forks            = repo.get("forkCount"),
+        watchers         = (repo.get("watchers") or {}).get("totalCount"),
+        is_archived      = repo.get("isArchived", False),
+        is_empty         = repo.get("isEmpty", False),
     )
 
-    # ── Commit velocity ───────────────────────────────────────────────────
     def _extract_commit_count(alias: str) -> Optional[int]:
         branch_ref = repo.get(alias)
         if not branch_ref:
@@ -616,7 +547,6 @@ def analyse_repository(
         last_90_days=c90,
     )
 
-    # ── Issue resolution metrics ──────────────────────────────────────────
     has_issues = repo.get("hasIssuesEnabled", True)
     issues_obj = repo.get("issues", {})
     issue_nodes = issues_obj.get("nodes", []) if issues_obj else []
@@ -669,7 +599,6 @@ def analyse_repository(
             has_issues_enabled=True,
         )
 
-    # ── Rate-limit snapshot ───────────────────────────────────────────────
     rate_limit_raw = gql_data.get("rateLimit")
     rate_limit_snapshot = None
     if rate_limit_raw:
@@ -682,15 +611,15 @@ def analyse_repository(
                     rate_limit_raw["resetAt"].replace("Z", "+00:00")
                 ),
             )
-            # Warn if we're burning through quota fast.
+   
             pct_used = rate_limit_raw["used"] / rate_limit_raw["limit"]
             if pct_used > 0.80:
                 print(
-                    f"    ⚠️  Rate limit warning: {rate_limit_raw['remaining']} points "
+                    f"   Rate limit warning: {rate_limit_raw['remaining']} points "
                     f"remaining (resets {rate_limit_raw['resetAt']})"
                 )
         except (KeyError, ValueError):
-            pass   # Non-critical — rate limit metadata is advisory only
+            pass  
 
     return QuantitativeMetrics(
         github_url=github_url,
@@ -702,9 +631,6 @@ def analyse_repository(
     )
 
 
-# ─────────────────────────────────────────────
-# §8  Agent 2 Entry Point
-# ─────────────────────────────────────────────
 
 def enrich_signal(
     item:    ClassifiedItem,
@@ -730,10 +656,10 @@ def enrich_signal(
         metrics = analyse_repository(url, token, session)
         metrics_list.append(metrics)
 
-        # Surface data gaps immediately for observability.
+        
         if metrics.data_gaps:
             for gap in metrics.data_gaps:
-                prefix = "    ⚠️ " if not gap.startswith("CRITICAL") else "    🚨 "
+                prefix = "   " if not gap.startswith("CRITICAL") else "   "
                 print(f"{prefix}{gap}")
 
     if own_session:
@@ -762,9 +688,6 @@ def run_quant_batch(
     return enriched
 
 
-# ─────────────────────────────────────────────
-# §9  Mock GraphQL Response (Phase 2 testing)
-# ─────────────────────────────────────────────
 
 def _build_mock_graphql_response(
     owner: str,
@@ -779,11 +702,10 @@ def _build_mock_graphql_response(
     """
     now = datetime.now(timezone.utc)
 
-    # Generate deterministic fake issue nodes with varied resolution times.
+
     issue_nodes = []
     for i in range(ISSUES_TO_FETCH):
         created = now - timedelta(days=90 - i)
-        # Resolution times: fast for recent issues, slower for old ones.
         resolution_hours = 2 + (i % 15) * 8
         closed = created + timedelta(hours=resolution_hours)
         issue_nodes.append({
@@ -831,10 +753,7 @@ def _patch_session_with_mock(
     repo:           str,
     disable_issues: bool = False,
 ) -> None:
-    """
-    Monkey-patches `session.post` to return a mock response object,
-    allowing full Agent 2 logic to run without a real GitHub token.
-    """
+    
     mock_data = _build_mock_graphql_response(owner, repo, disable_issues=disable_issues)
 
     mock_response = MagicMock()
@@ -845,9 +764,6 @@ def _patch_session_with_mock(
     session.post = MagicMock(return_value=mock_response)
 
 
-# ─────────────────────────────────────────────
-# §10  Pretty Printer
-# ─────────────────────────────────────────────
 
 def print_enriched_item(ei: EnrichedItem) -> None:
     """Human-readable summary of an EnrichedItem for Phase 2 validation."""
@@ -857,7 +773,7 @@ def print_enriched_item(ei: EnrichedItem) -> None:
     print(f"{'═'*65}")
 
     if not ei.metrics:
-        print("  ⚠️  No metrics — item was NOISE or had no GitHub URLs.")
+        print("    No metrics — item was NOISE or had no GitHub URLs.")
         return
 
     for m in ei.metrics:
@@ -867,7 +783,7 @@ def print_enriched_item(ei: EnrichedItem) -> None:
 
         print(f"\n  Repo         : {p.name_with_owner}  [{p.primary_language or 'unknown lang'}]")
         print(f"  Default branch: {p.default_branch or 'N/A'}  |  Archived: {p.is_archived}")
-        print(f"  Stars / Forks : {p.stars:,} ⭐  /  {p.forks:,} 🍴" if p.stars else "  Stars / Forks : N/A")
+        print(f"  Stars / Forks : {p.stars:,}   /  {p.forks:,} 🍴" if p.stars else "  Stars / Forks : N/A")
 
         print(f"\n  ── Commit Velocity ──────────────────────────────")
         print(f"  Last 30 days  : {cv.last_30_days}")
@@ -891,23 +807,16 @@ def print_enriched_item(ei: EnrichedItem) -> None:
         if m.data_gaps:
             print(f"\n  ── Data Gaps (Agent 3 must surface these) ───────")
             for gap in m.data_gaps:
-                print(f"  ⚠️  {gap}")
+                print(f"   {gap}")
 
 
-# ─────────────────────────────────────────────
-# §11  Entrypoint
-# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     print("=" * 65)
     print("  Agent 2: The Quantitative Engineer — Phase 2 Test Run")
     print("=" * 65)
 
-    # Build a representative set of mock ClassifiedItems that simulate
-    # what Agent 1 would have emitted, covering three edge cases:
-    #   (a) healthy repo with issues  → full metrics
-    #   (b) repo with issues disabled → partial metrics + data_gap
-    #   (c) NOISE item                → skipped entirely
+ 
 
     def _make_signal(item_id, title, github_urls) -> ClassifiedItem:
         raw = RawItem(
@@ -961,7 +870,7 @@ if __name__ == "__main__":
     use_mock = not token
 
     if use_mock:
-        print("\n  ⚠️  GITHUB_TOKEN not set — running with mock GraphQL responses.\n")
+        print("\n  GITHUB_TOKEN not set — running with mock GraphQL responses.\n")
 
     session = requests.Session()
     enriched_results: list[EnrichedItem] = []
@@ -972,18 +881,16 @@ if __name__ == "__main__":
 
         if use_mock:
             owner, repo = parse_github_url(signal.raw.github_urls[0])
-            # Simulate disabled issues on the second repo to test that code path.
             _patch_session_with_mock(session, owner, repo, disable_issues=(idx == 1))
 
         ei = enrich_signal(signal, token or "MOCK", session)
         enriched_results.append(ei)
         print_enriched_item(ei)
 
-    # Also verify NOISE is skipped cleanly.
     print(f"\n{'─'*65}")
     print("  [Agent 2] Processing NOISE item (should be skipped)…")
     noise_result = enrich_signal(mock_noise_item, token or "MOCK", session)
-    print(f"  Metrics list length: {len(noise_result.metrics)}  (expected: 0) ✅")
+    print(f"  Metrics list length: {len(noise_result.metrics)}  (expected: 0) ")
 
     session.close()
 
